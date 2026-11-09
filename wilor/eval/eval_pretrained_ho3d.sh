@@ -1,0 +1,26 @@
+#!/bin/bash
+#SBATCH --job-name=wilor_eval_pretrained_ho3d
+#SBATCH -o /workspace/drag1008/wilor/slurm/o/%x.o%j
+#SBATCH -e /workspace/drag1008/wilor/slurm/e/%x.e%j
+#SBATCH --partition=R3090
+#SBATCH --qos=default
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --nodelist=soda-03
+#SBATCH --mem=16G
+#SBATCH --time=12:00:00
+
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate wilor
+
+export PYTHONUNBUFFERED=1
+cd /workspace/drag1008/wilor
+
+python -u eval_metric_scale.py \
+    --dataset_npz /nas2/lait/1000_Members/jaehoon/HO3D_v3/ho3d_annotations.npz \
+    --img_dir /nas2/lait/1000_Members/jaehoon/HO3D_v3 \
+    --checkpoint ./pretrained_models/wilor_final.ckpt \
+    --split_mode all \
+    --batch_size 32 --num_workers 4

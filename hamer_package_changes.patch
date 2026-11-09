@@ -1,0 +1,255 @@
+diff --git a/hamer/configs_hydra/experiment/hamer_vit_transformer.yaml b/hamer/configs_hydra/experiment/hamer_vit_transformer.yaml
+index 1a3a592..0a2a02b 100644
+--- a/hamer/configs_hydra/experiment/hamer_vit_transformer.yaml
++++ b/hamer/configs_hydra/experiment/hamer_vit_transformer.yaml
+@@ -32,6 +32,10 @@ MODEL:
+   MANO_HEAD:
+     TYPE: transformer_decoder
+     IN_CHANNELS: 2048
++    BETA_ADAPTER: True
++    BETA_ADAPTER_RANK: 64
++    BETA_ADAPTER_DZ: 128
++    BETA_ADAPTER_ONLY: True  # freeze backbone + head, train only the adapter
+     TRANSFORMER_DECODER:
+       depth: 6
+       heads: 8
+diff --git a/hamer/models/hamer.py b/hamer/models/hamer.py
+index 8a79e4d..11478cf 100644
+--- a/hamer/models/hamer.py
++++ b/hamer/models/hamer.py
+@@ -65,6 +65,8 @@ class HAMER(pl.LightningModule):
+         self.automatic_optimization = False
+ 
+     def get_parameters(self):
++        if self.cfg.MODEL.MANO_HEAD.get('BETA_ADAPTER', False) and self.cfg.MODEL.MANO_HEAD.get('BETA_ADAPTER_ONLY', False):
++            return list(self.mano_head.beta_adapter.parameters())
+         all_params = list(self.mano_head.parameters())
+         all_params += list(self.backbone.parameters())
+         return all_params
+@@ -104,12 +106,21 @@ class HAMER(pl.LightningModule):
+         # if using ViT backbone, we need to use a different aspect ratio
+         conditioning_feats = self.backbone(x[:,:,:,32:-32])
+ 
+-        pred_mano_params, pred_cam, _ = self.mano_head(conditioning_feats)
++        beta_cond = None
++        if self.cfg.MODEL.MANO_HEAD.get('BETA_ADAPTER', False) and train and 'mano_params' in batch:
++            gt_betas = batch['mano_params']['betas']
++            has_betas = batch['has_mano_params']['betas'].to(gt_betas.dtype).unsqueeze(-1)
++            # zero out invalid GT betas -> falls back to the (zero-centered) mean shape
++            beta_cond = gt_betas * has_betas
++
++        pred_mano_params, pred_cam, pred_mano_params_list = self.mano_head(conditioning_feats, beta_cond=beta_cond)
+ 
+         # Store useful regression outputs to the output dict
+         output = {}
+         output['pred_cam'] = pred_cam
+         output['pred_mano_params'] = {k: v.clone() for k,v in pred_mano_params.items()}
++        if self.cfg.MODEL.MANO_HEAD.get('USE_2D_HEAD', False):
++            output['pred_kp2d_mlp_head'] = pred_mano_params_list['pred_kp2d_mlp']
+ 
+         # Compute camera translation
+         device = pred_mano_params['hand_pose'].device
+@@ -170,6 +181,12 @@ class HAMER(pl.LightningModule):
+         loss_keypoints_2d = self.keypoint_2d_loss(pred_keypoints_2d, gt_keypoints_2d)
+         loss_keypoints_3d = self.keypoint_3d_loss(pred_keypoints_3d, gt_keypoints_3d, pelvis_id=0)
+ 
++        # Auxiliary 2D loss for the plain-MLP head (reads the same global token as decpose/
++        # decshape/deccam, but through its own separate parameters -- not fed into FK/solver)
++        use_2d_head = self.cfg.MODEL.MANO_HEAD.get('USE_2D_HEAD', False)
++        if use_2d_head:
++            loss_kp2d_mlp_head = self.keypoint_2d_loss(output['pred_kp2d_mlp_head'], gt_keypoints_2d)
++
+         # Compute loss on MANO parameters
+         loss_mano_params = {}
+         for k, pred in pred_mano_params.items():
+@@ -182,10 +199,14 @@ class HAMER(pl.LightningModule):
+         loss = self.cfg.LOSS_WEIGHTS['KEYPOINTS_3D'] * loss_keypoints_3d+\
+                self.cfg.LOSS_WEIGHTS['KEYPOINTS_2D'] * loss_keypoints_2d+\
+                sum([loss_mano_params[k] * self.cfg.LOSS_WEIGHTS[k.upper()] for k in loss_mano_params])
++        if use_2d_head:
++            loss = loss + self.cfg.LOSS_WEIGHTS.get('KP2D_MLP_HEAD', 0.01) * loss_kp2d_mlp_head
+ 
+         losses = dict(loss=loss.detach(),
+                       loss_keypoints_2d=loss_keypoints_2d.detach(),
+                       loss_keypoints_3d=loss_keypoints_3d.detach())
++        if use_2d_head:
++            losses['loss_kp2d_mlp_head'] = loss_kp2d_mlp_head.detach()
+ 
+         for k, v in loss_mano_params.items():
+             losses['loss_' + k] = v.detach()
+diff --git a/hamer/models/heads/mano_head.py b/hamer/models/heads/mano_head.py
+index c584873..5aad418 100644
+--- a/hamer/models/heads/mano_head.py
++++ b/hamer/models/heads/mano_head.py
+@@ -6,6 +6,7 @@ import einops
+ 
+ from ...utils.geometry import rot6d_to_rotmat, aa_to_rotmat
+ from ..components.pose_transformer import TransformerDecoder
++from ..components.beta_context_adapter import BetaContextAdapter
+ 
+ def build_mano_head(cfg):
+     mano_head_type = cfg.MODEL.MANO_HEAD.get('TYPE', 'hamer')
+@@ -54,12 +55,39 @@ class MANOTransformerDecoderHead(nn.Module):
+         self.register_buffer('init_betas', init_betas)
+         self.register_buffer('init_cam', init_cam)
+ 
+-    def forward(self, x, **kwargs):
++        self.use_2d_head = cfg.MODEL.MANO_HEAD.get('USE_2D_HEAD', False)
++        if self.use_2d_head:
++            # separate MLP reading off the SAME global token as decpose/decshape/deccam,
++            # no extra query tokens, no confidence output -- just (u,v) x 21
++            self.kp2d_mlp_head = nn.Sequential(
++                nn.LayerNorm(dim),
++                nn.Linear(dim, 512),
++                nn.GELU(),
++                nn.Linear(512, 2 * 21),
++            )
++            nn.init.zeros_(self.kp2d_mlp_head[-1].weight)
++            nn.init.zeros_(self.kp2d_mlp_head[-1].bias)
++
++        self.use_beta_adapter = cfg.MODEL.MANO_HEAD.get('BETA_ADAPTER', False)
++        if self.use_beta_adapter:
++            self.beta_adapter = BetaContextAdapter(
++                d_ctx=transformer_args['context_dim'],
++                r=cfg.MODEL.MANO_HEAD.get('BETA_ADAPTER_RANK', 64),
++                d_z=cfg.MODEL.MANO_HEAD.get('BETA_ADAPTER_DZ', 128),
++                d_beta=10,
++            )
++
++    def forward(self, x, beta_cond=None, **kwargs):
+ 
+         batch_size = x.shape[0]
+         # vit pretrained backbone is channel-first. Change to token-first
+         x = einops.rearrange(x, 'b c h w -> b (h w) c')
+ 
++        if self.use_beta_adapter:
++            if beta_cond is None:
++                beta_cond = self.init_betas.expand(batch_size, -1)
++            x = self.beta_adapter(x, beta_cond)
++
+         init_hand_pose = self.init_hand_pose.expand(batch_size, -1)
+         init_betas = self.init_betas.expand(batch_size, -1)
+         init_cam = self.init_cam.expand(batch_size, -1)
+@@ -74,6 +102,7 @@ class MANOTransformerDecoderHead(nn.Module):
+         pred_hand_pose_list = []
+         pred_betas_list = []
+         pred_cam_list = []
++        pred_kp2d_mlp = None
+         for i in range(self.cfg.MODEL.MANO_HEAD.get('IEF_ITERS', 1)):
+             # Input token to transformer is zero token
+             if self.input_is_mean_shape:
+@@ -93,6 +122,9 @@ class MANOTransformerDecoderHead(nn.Module):
+             pred_betas_list.append(pred_betas)
+             pred_cam_list.append(pred_cam)
+ 
++            if self.use_2d_head:
++                pred_kp2d_mlp = self.kp2d_mlp_head(token_out).view(batch_size, 21, 2)
++
+         # Convert self.joint_rep_type -> rotmat
+         joint_conversion_fn = {
+             '6d': rot6d_to_rotmat,
+@@ -108,4 +140,6 @@ class MANOTransformerDecoderHead(nn.Module):
+         pred_mano_params = {'global_orient': pred_hand_pose[:, [0]],
+                             'hand_pose': pred_hand_pose[:, 1:],
+                             'betas': pred_betas}
++        if self.use_2d_head:
++            pred_mano_params_list['pred_kp2d_mlp'] = pred_kp2d_mlp
+         return pred_mano_params, pred_cam, pred_mano_params_list
+diff --git a/hamer/models/components/lora.py b/hamer/models/components/lora.py
+new file mode 100644
+index 0000000..f9dbbc8
+--- /dev/null
++++ b/hamer/models/components/lora.py
+@@ -0,0 +1,55 @@
++"""Minimal LoRA wrapper for the HaMeR ViT backbone.
++
++Freezes the wrapped nn.Linear's original weight/bias and adds a low-rank
++additive path (B @ A), zero-initialized so the wrapped module starts as an
++exact identity to the un-wrapped linear layer.
++"""
++import torch
++import torch.nn as nn
++
++
++class LoRALinear(nn.Module):
++    def __init__(self, base: nn.Linear, r: int = 8, alpha: int = 16):
++        super().__init__()
++        self.base = base
++        for p in self.base.parameters():
++            p.requires_grad_(False)
++        self.r = r
++        self.scale = alpha / r
++        self.lora_A = nn.Linear(base.in_features, r, bias=False)
++        self.lora_B = nn.Linear(r, base.out_features, bias=False)
++        nn.init.kaiming_uniform_(self.lora_A.weight, a=5 ** 0.5)
++        nn.init.zeros_(self.lora_B.weight)
++
++    def forward(self, x):
++        return self.base(x) + self.scale * self.lora_B(self.lora_A(x))
++
++
++def apply_lora_to_vit(backbone: nn.Module, r: int = 8, alpha: int = 16,
++                       targets=('qkv', 'proj', 'fc1', 'fc2')) -> int:
++    """In-place replace target nn.Linear submodules inside backbone.blocks with
++    LoRALinear. Returns the number of layers wrapped."""
++    n_wrapped = 0
++    for block in backbone.blocks:
++        for name in targets:
++            # 'proj' exists both on attn (attn.proj) and elsewhere; only patch attn.proj here
++            module_holder, attr = (block.attn, name) if hasattr(block, 'attn') and hasattr(block.attn, name) else (None, None)
++            if module_holder is None and hasattr(block, 'mlp') and hasattr(block.mlp, name):
++                module_holder, attr = block.mlp, name
++            if module_holder is None:
++                continue
++            base_linear = getattr(module_holder, attr)
++            if not isinstance(base_linear, nn.Linear) or isinstance(base_linear, LoRALinear):
++                continue
++            setattr(module_holder, attr, LoRALinear(base_linear, r=r, alpha=alpha))
++            n_wrapped += 1
++    return n_wrapped
++
++
++def lora_parameters(backbone: nn.Module):
++    params = []
++    for m in backbone.modules():
++        if isinstance(m, LoRALinear):
++            params += list(m.lora_A.parameters())
++            params += list(m.lora_B.parameters())
++    return params
+diff --git a/hamer/models/components/beta_context_adapter.py b/hamer/models/components/beta_context_adapter.py
+new file mode 100644
+index 0000000..0e78f17
+--- /dev/null
++++ b/hamer/models/components/beta_context_adapter.py
+@@ -0,0 +1,31 @@
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++
++class BetaContextAdapter(nn.Module):
++    """Zero-init low-rank adapter that injects MANO shape (beta) conditioning
++    into the ViT context tokens fed to the cross-attention MANO head.
++
++    At init this module is the identity function (proj_z and up are zero
++    initialized), so plugging it in does not change the pretrained model's
++    behavior until it is fine-tuned.
++    """
++
++    def __init__(self, d_ctx=1280, r=64, d_z=128, d_beta=10):
++        super().__init__()
++        self.enc = nn.Sequential(
++            nn.Linear(d_beta, 128), nn.SiLU(), nn.Linear(128, d_z)
++        )
++        self.norm = nn.LayerNorm(d_ctx)
++        self.down = nn.Linear(d_ctx, r)
++        self.proj_z = nn.Linear(d_z, r)
++        self.up = nn.Linear(r, d_ctx)
++        nn.init.zeros_(self.proj_z.weight); nn.init.zeros_(self.proj_z.bias)
++        nn.init.zeros_(self.up.weight);     nn.init.zeros_(self.up.bias)
++
++    def forward(self, ctx, beta):            # ctx [B,N,d_ctx], beta [B,d_beta]
++        z = self.enc(beta)                    # [B,d_z]
++        h = self.down(self.norm(ctx))         # [B,N,r]
++        h = h + self.proj_z(z).unsqueeze(1)
++        return ctx + self.up(F.gelu(h))

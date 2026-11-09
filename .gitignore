@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.log
+wandb/
+slurm/
+outputs/
