@@ -1,6 +1,12 @@
 # hand_experiments
 
-HaMeR / WiLoR 기반 손 복원 실험 코드 모음. 결과 정리는 [RESULTS.md](RESULTS.md).
+HaMeR / WiLoR 기반 손 복원 실험 코드 모음.
+
+| 문서 | 내용 |
+|---|---|
+| [OVERVIEW.md](OVERVIEW.md) | 왜 이 실험들이 필요했는지, 각 실험에서 무엇을 확인하려 했고 무엇을 알게 됐는지 |
+| [RESULTS.md](RESULTS.md) | 실험 설정(모델 M0~M4, 방법 P0~P6)과 전체 수치 표 |
+| README.md (이 문서) | 폴더 구성, 실험별 스크립트 위치, 실행 환경, 라이선스 |
 
 - **손 모양 모델 (M0~M4)**: HaMeR backbone 학습 방식 비교
 - **손 위치 방법 (P0~P6)**: 예측한 손을 실제 카메라 좌표계에 배치하는 방법 비교 (HaMeR, WiLoR)
